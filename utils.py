@@ -1,4 +1,9 @@
 import numpy as np
+from threading import Event, Thread
+from time import perf_counter
+
+import pandas as pd
+from IPython.display import display
 
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import (
@@ -132,3 +137,90 @@ def evaluate_model(
         "r2": r2,
         "predictions": predictions
     }
+
+
+def run_grid_search(
+    X_train,
+    y_train,
+    *,
+    imputers,
+    models,
+    cv,
+    prepare_features,
+    fit_and_score,
+):
+    folds = list(cv.split(X_train, y_train))
+    n_folds = len(folds)
+    total = len(imputers) * n_folds * (1 + len(models))
+    completed = 0
+    results = []
+    status = display("Starting grid search", display_id=True)
+
+    def run_step(label, operation, *args):
+        nonlocal completed
+
+        started = perf_counter()
+        stop = Event()
+
+        def show(state):
+            elapsed = perf_counter() - started
+            status.update(
+                f"{completed}/{total} ({completed / total:.0%}) | "
+                f"{state}: {label} | {elapsed:.1f}s"
+            )
+
+        def refresh():
+            while not stop.wait(1):
+                show("Running")
+
+        show("Running")
+        timer = Thread(target=refresh, daemon=True)
+        timer.start()
+
+        state = "Interrupted"
+        try:
+            result = operation(*args)
+            completed += 1
+            state = "Completed"
+            return result
+        except Exception:
+            state = "Failed"
+            raise
+        finally:
+            stop.set()
+            timer.join()
+            show(state)
+
+    for imputer_name, imputer in imputers:
+        scores = {spec[0]: [] for spec in models}
+
+        for fold_no, (fit_idx, val_idx) in enumerate(folds, start=1):
+            label = f"{imputer_name} | Fold {fold_no}/{n_folds}"
+            X_fit, X_val = run_step(
+                f"{label} | Imputation",
+                prepare_features,
+                imputer,
+                X_train.iloc[fit_idx],
+                X_train.iloc[val_idx],
+            )
+            y_fit, y_val = y_train.iloc[fit_idx], y_train.iloc[val_idx]
+
+            for spec in models:
+                model_name = spec[0]
+                metrics = run_step(
+                    f"{label} | {model_name}",
+                    fit_and_score,
+                    spec,
+                    X_fit,
+                    X_val,
+                    y_fit,
+                    y_val,
+                )
+                scores[model_name].append(metrics)
+
+        for model_name, fold_scores in scores.items():
+            means = pd.DataFrame(fold_scores).mean().to_dict()
+            results.append({"imputer": imputer_name, "model": model_name, **means})
+
+    status.update(f"Grid search complete | {completed}/{total} (100%)")
+    return pd.DataFrame(results).sort_values("rmse", kind="stable", ignore_index=True)
